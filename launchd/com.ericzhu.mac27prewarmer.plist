@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ericzhu.mac27prewarmer</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/bin/mac27-prewarmer</string>
+        <string>--delay</string>
+        <string>90</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>14400</integer>
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>/tmp/mac27-prewarmer.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/mac27-prewarmer.err</string>
+</dict>
+</plist>
