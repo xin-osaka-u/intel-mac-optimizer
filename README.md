@@ -177,3 +177,7 @@ sudo rm /usr/local/bin/smc-fan-helper /Library/LaunchDaemons/com.ericzhu.maxvnod
 - **屏幕休眠时切换器可能返回非 0、非 1 的状态值。** 只判断 0（独显）和非 0（核显），并且在屏幕休眠时跳过所有切换逻辑。
 - 在 SIP 保护下，`launchctl disable` 对苹果自带的服务不起作用，重启后也不起作用。
 - 后台项目被标为"不允许"时，LaunchDaemon 开机不会加载，命令行也不会报错。
+
+## 许可证
+
+MIT，见 [LICENSE](LICENSE)。按原样提供、不做任何担保；写 SMC 和安装 root 程序的风险由使用者自行承担。
