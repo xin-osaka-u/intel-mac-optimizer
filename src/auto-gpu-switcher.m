@@ -13,6 +13,7 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <mach/mach_time.h>
 #include <math.h>
 
 #define HEARTBEAT_PATH "/tmp/autogpu.heartbeat"
@@ -335,6 +336,90 @@ static GPUTelemetry read_gpu_telemetry(BOOL needAMDDetails) {
     return t;
 }
 
+// Inspects the AMD IOAccelerator user clients. When snapshotOnly is NO, formats a summary of non-daemon
+// processes holding AMD acceleration handles (highlighting any new handles opened since prevCreators and any
+// command queues that submitted work within the last 15s), then updates *prevCreatorsRef.
+static NSString *query_amd_accel_holders(NSSet<NSString *> * __strong *prevCreatorsRef, BOOL snapshotOnly) {
+    static NSSet<NSString *> *ignoredDaemons = nil;
+    if (!ignoredDaemons) {
+        ignoredDaemons = [NSSet setWithArray:@[
+            @"WindowServer", @"loginwindow", @"TouchBarServer", @"ControlCenter", @"ControlStrip",
+            @"NotificationCent", @"Dock", @"DockHelper", @"com.apple.dock.e", @"Finder", @"Spotlight",
+            @"WallpaperAerials", @"CursorUIViewServ", @"AccessibilityUIS", @"TextInputMenuAge",
+            @"TextInputSwitche", @"SCIM_Extension", @"TCIM_Extension", @"JapaneseIM-Romaj",
+            @"iconservicesagen", @"CoreServicesUIAg", @"UserNotification", @"PowerChime",
+            @"coreautha", @"SafeEjectGPUServ", @"systemmigrationd", @"MTLAssetUpgrader",
+            @"LinkedNotesUISer", @"AutoGPU", @"Turbo Boost Swit"
+        ]];
+    }
+
+    io_iterator_t iter;
+    if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAccelerator"), &iter) != kIOReturnSuccess)
+        return @"none";
+
+    NSMutableSet<NSString *> *curCreators = [NSMutableSet set];
+    NSMutableArray<NSString *> *holders = snapshotOnly ? nil : [NSMutableArray array];
+    NSMutableArray<NSString *> *newHolders = snapshotOnly ? nil : [NSMutableArray array];
+    NSMutableArray<NSString *> *activeQueues = snapshotOnly ? nil : [NSMutableArray array];
+    NSSet<NSString *> *prevCreators = prevCreatorsRef ? *prevCreatorsRef : nil;
+    uint64_t nowMat = mach_absolute_time();
+
+    io_service_t entry;
+    while ((entry = IOIteratorNext(iter)) != 0) {
+        CFTypeRef classRef = IORegistryEntryCreateCFProperty(entry, CFSTR("IOClass"), kCFAllocatorDefault, 0);
+        if (classRef) {
+            NSString *cls = (__bridge NSString *)classRef;
+            if ([cls containsString:@"AMD"]) {
+                io_iterator_t childIter = 0;
+                if (IORegistryEntryGetChildIterator(entry, kIOServicePlane, &childIter) == kIOReturnSuccess) {
+                    io_registry_entry_t child;
+                    while ((child = IOIteratorNext(childIter)) != 0) {
+                        CFTypeRef creatorRef = IORegistryEntryCreateCFProperty(child, CFSTR("IOUserClientCreator"), kCFAllocatorDefault, 0);
+                        if (creatorRef && CFGetTypeID(creatorRef) == CFStringGetTypeID()) {
+                            NSString *creator = (__bridge NSString *)creatorRef;
+                            [curCreators addObject:creator];
+                            if (!snapshotOnly) {
+                                NSRange sep = [creator rangeOfString:@", "];
+                                NSString *proc = (sep.location != NSNotFound) ? [creator substringFromIndex:NSMaxRange(sep)] : creator;
+                                if (proc.length > 0 && ![ignoredDaemons containsObject:proc]) {
+                                    if (![holders containsObject:proc]) [holders addObject:proc];
+                                    if (prevCreators && ![prevCreators containsObject:creator] && ![newHolders containsObject:proc]) {
+                                        [newHolders addObject:proc];
+                                    }
+                                    CFTypeRef subRef = IORegistryEntryCreateCFProperty(child, CFSTR("lastSubmittedTime"), kCFAllocatorDefault, 0);
+                                    if (subRef && CFGetTypeID(subRef) == CFNumberGetTypeID()) {
+                                        uint64_t subTime = 0;
+                                        CFNumberGetValue((CFNumberRef)subRef, kCFNumberSInt64Type, &subTime);
+                                        if (subTime > 0 && nowMat >= subTime && (nowMat - subTime) <= 15000000000ULL) {
+                                            if (![activeQueues containsObject:proc]) [activeQueues addObject:proc];
+                                        }
+                                    }
+                                    if (subRef) CFRelease(subRef);
+                                }
+                            }
+                        }
+                        if (creatorRef) CFRelease(creatorRef);
+                        IOObjectRelease(child);
+                    }
+                    IOObjectRelease(childIter);
+                }
+            }
+            CFRelease(classRef);
+        }
+        IOObjectRelease(entry);
+    }
+    IOObjectRelease(iter);
+
+    if (prevCreatorsRef) *prevCreatorsRef = [curCreators copy];
+    if (snapshotOnly) return nil;
+
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    if (newHolders.count > 0)   [parts addObject:[NSString stringWithFormat:@"new=%@", [newHolders componentsJoinedByString:@", "]]];
+    if (activeQueues.count > 0) [parts addObject:[NSString stringWithFormat:@"activeQ=%@", [activeQueues componentsJoinedByString:@", "]]];
+    if (holders.count > 0)      [parts addObject:[NSString stringWithFormat:@"holders=%@", [holders componentsJoinedByString:@", "]]];
+    return parts.count > 0 ? [parts componentsJoinedByString:@" | "] : @"none";
+}
+
 // Enumerate all CoreAudio input devices so non-default microphones selected inside VooV/Zoom are also detected
 static BOOL is_any_microphone_active(void) {
     AudioObjectPropertyAddress devAddr = {
@@ -490,6 +575,13 @@ static NSString *matched_heavy_domain(NSString *url, NSArray<NSString *> *heavyD
     return nil;
 }
 
+// Host part only (e.g. "www.linkedin.com"); paths and queries are never logged.
+static NSString *url_host_only(NSString *url) {
+    if (!url || url.length == 0) return nil;
+    NSString *host = [[NSURL URLWithString:url] host];
+    return host.length > 0 ? host : nil;
+}
+
 static double calc_5d_rpm(BOOL isLeftFan,
                           BOOL dgpuActive,
                           BOOL inMeetingMode,
@@ -641,6 +733,7 @@ static double calc_5d_rpm(BOOL isLeftFan,
 @property (assign) BOOL helperAuthed;
 @property (assign) BOOL menuIsOpen;
 @property (assign) BOOL inMeetingMode;
+@property (strong) NSSet<NSString *> *lastAMDClientCreators;
 @end
 
 @implementation AutoGPUAppDelegate
@@ -798,8 +891,9 @@ static double calc_5d_rpm(BOOL isLeftFan,
     _lastAppliedL = -1;
     _lastAppliedR = -1;
     _dgpuHoldSeconds = 60.0;
+    query_amd_accel_holders(&_lastAMDClientCreators, YES);
 
-    log_autogpu(@"AutoGPU v3.3 started (SMC=%s, HelperAuthed=%s, F0=%.0f..%.0f, F1=%.0f..%.0f, OSThermalGuard=%s, CPU_Speed_Limit=%d, thermalState=%ld)",
+    log_autogpu(@"AutoGPU v3.5 started (SMC=%s, HelperAuthed=%s, F0=%.0f..%.0f, F1=%.0f..%.0f, OSThermalGuard=%s, CPU_Speed_Limit=%d, thermalState=%ld)",
                 _smcConn ? "OK" : "FAIL", _helperAuthed ? "YES" : "NO", _f0Min, _f0Max, _f1Min, _f1Max,
                 _osThermalGuardEnabled ? "ON" : "OFF", read_cpu_speed_limit(), (long)[[NSProcessInfo processInfo] thermalState]);
 
@@ -1097,12 +1191,19 @@ static double calc_5d_rpm(BOOL isLeftFan,
             _dgpuHoldSeconds = 60.0;
         }
         _dgpuHoldUntil = nowUptime + _dgpuHoldSeconds;
-        log_autogpu(@"dGPU active (%s), holding for %.0fs before trying the iGPU again",
-                    _autoGPURequestedDGPU ? "requested by AutoGPU" : "pulled in by macOS or an app", _dgpuHoldSeconds);
+        if (_autoGPURequestedDGPU) {
+            query_amd_accel_holders(&_lastAMDClientCreators, YES);
+            log_autogpu(@"dGPU active (requested by AutoGPU), holding for %.0fs before trying the iGPU again", _dgpuHoldSeconds);
+        } else {
+            NSString *amdClients = query_amd_accel_holders(&_lastAMDClientCreators, NO);
+            log_autogpu(@"dGPU active (pulled in by macOS or an app; AMD clients: %@), holding for %.0fs before trying the iGPU again",
+                        amdClients, _dgpuHoldSeconds);
+        }
     } else if (currentGpu != 0 && _dgpuEpisodeActive && !_muxSwitchInFlight) {
         _dgpuEpisodeActive = NO;
         _autoGPURequestedDGPU = NO;
         _lastReturnToIGPUAt = nowUptime;
+        query_amd_accel_holders(&_lastAMDClientCreators, YES);
     }
 
     if (g_rawMuxState > 1 && g_rawMuxState != _lastLoggedRawMuxState) {
@@ -1162,7 +1263,13 @@ static double calc_5d_rpm(BOOL isLeftFan,
             _lowLoadStreak = 0;
             wantDiscrete = YES;
             self.lastReason = [NSString stringWithFormat:@"核显高负载救援 (%d%%)", gt.igpuUtil];
-            if (currentGpu != 0) [self switchToDiscreteWithReason:self.lastReason];
+            if (currentGpu != 0) {
+                NSString *host = chromeIsFront ? url_host_only(_cachedChromeURL) : nil;
+                log_autogpu(@"iGPU overload at %d%%: front app %@%@", gt.igpuUtil,
+                            frontApp.localizedName ?: (frontBundleId.length ? frontBundleId : @"unknown"),
+                            host ? [NSString stringWithFormat:@" (%@)", host] : @"");
+                [self switchToDiscreteWithReason:self.lastReason];
+            }
         } else if (dgpuSustainingLoad) {
             _lowLoadStreak = 0;
             wantDiscrete = YES;

@@ -129,6 +129,7 @@ static int is_excluded(const char *path, int is_dir) {
 static size_t count_resident_pages(int fd, off_t offset, size_t length, char *vec) {
     const size_t page_sz = 4096;
     size_t num_pages = (length + page_sz - 1) / page_sz;
+    memset(vec, 0, num_pages);
     size_t resident = 0;
     void *addr = mmap(NULL, length, PROT_READ, MAP_FILE | MAP_SHARED, fd, offset);
     if (addr == MAP_FAILED) return 0;
@@ -137,13 +138,15 @@ static size_t count_resident_pages(int fd, off_t offset, size_t length, char *ve
         for (size_t p = 0; p < num_pages; p++) {
             if (vec[p] & MINCORE_INCORE) resident++;
         }
+    } else {
+        memset(vec, 0, num_pages);
     }
     munmap(addr, length);
     return resident;
 }
 
-// Bring [start_offset, start_offset + length) into the Unified Buffer Cache. Windows that mincore() reports fully
-// resident are skipped; the rest are read with pread(), then residency is measured again for the report.
+// Bring [start_offset, start_offset + length) into the Unified Buffer Cache. Pages that mincore() reports
+// resident are skipped; only missing page runs are read with pread(), then residency is measured again.
 static void warm_and_verify_range(int fd, off_t start_offset, off_t length) {
     if (length <= 0) return;
     const size_t page_sz = 4096;
@@ -171,15 +174,30 @@ static void warm_and_verify_range(int fd, off_t start_offset, off_t length) {
 
         size_t bytes_in_window = chunk;
         if (resident < num_pages) {
-            bytes_in_window = 0;
-            while (bytes_in_window < chunk) {
-                size_t to_read = chunk - bytes_in_window;
-                if (to_read > io_buf_sz) to_read = io_buf_sz;
-                ssize_t r = pread(fd, io_buf, to_read, cur_off + (off_t)bytes_in_window);
-                if (r <= 0) break; // EOF / concurrent truncation
-                bytes_in_window += (size_t)r;
+            size_t p = 0;
+            while (p < num_pages) {
+                while (p < num_pages && (vec[p] & MINCORE_INCORE)) p++;
+                if (p >= num_pages) break;
+                size_t p_start = p;
+                while (p < num_pages && !(vec[p] & MINCORE_INCORE)) p++;
+                size_t run_off = p_start * page_sz;
+                size_t run_end = p * page_sz;
+                if (run_end > chunk) run_end = chunk;
+                size_t run_len = run_end - run_off;
+                size_t done = 0;
+                while (done < run_len) {
+                    size_t to_read = run_len - done;
+                    if (to_read > io_buf_sz) to_read = io_buf_sz;
+                    ssize_t r = pread(fd, io_buf, to_read, cur_off + (off_t)run_off + (off_t)done);
+                    if (r <= 0) { // EOF / concurrent truncation
+                        bytes_in_window = run_off + done;
+                        p = num_pages;
+                        break;
+                    }
+                    done += (size_t)r;
+                    total_read_bytes += (size_t)r;
+                }
             }
-            total_read_bytes += bytes_in_window;
             if (bytes_in_window == 0) break;
             resident = count_resident_pages(fd, cur_off, bytes_in_window, vec);
         }
